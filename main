@@ -1,0 +1,169 @@
+import os
+import time
+import hmac
+import base64
+import hashlib
+import requests
+from dotenv import load_dotenv
+
+# 환경 변수 로드
+load_dotenv()
+# ----------------- 설정 -----------------
+# HCX
+CLOVA_API_KEY = os.getenv("CLOVASTUDIO_API_KEY", "")
+CLOVA_REQUEST_ID = os.getenv("CLOVA_REQUEST_ID", "")
+MODEL_NAME = "HCX-DASH-002"
+
+CLOVA_CHAT_URL = f"https://clovastudio.stream.ntruss.com/testapp/v3/chat-completions/{MODEL_NAME}"
+
+# News Search API 설정
+NAVER_CLIENT_ID     = os.getenv("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+NEWS_API_URL        = "https://openapi.naver.com/v1/search/news.json"
+
+# Outbound Mailer API 설정
+ACCESS_KEY      = os.getenv("NCLOUD_ACCESS_KEY")
+SECRET_KEY      = os.getenv("NCLOUD_SECRET_KEY")
+API_SERVER      = "https://mail.apigw.ntruss.com"
+MAIL_URI        = "/api/v1/mails"  # 쿼리 파라미터 제거 :contentReference[oaicite:6]{index=6}
+
+SENDER_EMAIL    = os.getenv("SENDER_EMAIL")
+SENDER_NAME     = os.getenv("SENDER_NAME")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+RECIPIENT_NAME  = os.getenv("RECIPIENT_NAME", "수신자")  # 수신자 이름 필수 :contentReference[oaicite:7]{index=7}
+
+
+def fetch_latest_news(query="최신 뉴스", display=5):
+    headers = {
+        "X-Naver-Client-Id":     NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        "Accept":                "*/*"
+    }
+    params = {"query": query, "display": display, "sort": "date"}
+    resp = requests.get(NEWS_API_URL, headers=headers, params=params)
+    resp.raise_for_status()
+    return resp.json().get("items", [])
+
+
+def summarize_news(articles):
+    # 1. [수정] AI의 역할과 작업 방식을 더 명확하게 지시하는 System Prompt
+    system_prompt = """
+너는 뉴스 기사를 전문적으로 요약하는 어시스턴트야.
+사용자가 '---'로 구분된 여러 뉴스 기사를 전달할 거야.
+각 기사의 '제목', '내용', '링크'를 바탕으로, 아래 '출력 형식'을 정확히 따라서 기사별로 내용을 생성해 줘.
+
+주어진 '내용'을 2~3 문장으로 요약하고, '링크'는 반드시 해당 기사의 것을 그대로 사용해야 해.
+다른 설명이나 구분자는 절대 추가하지 마.
+
+[출력 형식]
+- 뉴스 제목: [기사 제목]
+- 뉴스 요약: [기사 내용 요약]
+- 원문 링크: [기사 원문 링크]
+"""
+
+    # 2. User Content 생성 부분 (수정할 필요 없음)
+    article_texts = []
+    for i, article in enumerate(articles, 1):
+        text = (
+            f"[기사 {i}]\n"
+            f"제목: {article.get('title', 'N/A')}\n"
+            f"내용: {article.get('description', 'N/A')}\n"
+            f"링크: {article.get('originallink', 'N/A')}"
+        )
+        article_texts.append(text)
+
+    user_content = "다음 뉴스들을 요약해줘:\n\n" + "\n\n---\n\n".join(article_texts)    # 각 기사 사이에 구분선을 넣어 AI가 명확히 인지하도록 함
+
+    # 3. Payload 구성
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "maxTokens": 1500  # 여러 기사 요약을 위해 maxTokens를 넉넉하게 설정
+    }
+
+    # API 요청 및 응답 처리 (기존 코드와 동일)
+    headers = {
+        "Authorization": f"Bearer {CLOVA_API_KEY}",
+        "X-NCP-CLOVASTUDIO-REQUEST-ID": CLOVA_REQUEST_ID,
+        "Content-Type": "application/json"
+    }
+
+    res = requests.post(CLOVA_CHAT_URL, headers=headers, json=payload)
+    res.raise_for_status()
+    data = res.json()
+
+    if "error" in data:
+        raise RuntimeError(f"CLOVA API Error: {data['error'].get('message', data)}")
+
+    if "result" in data:
+        msg = data["result"].get("message", {})
+        if "content" in msg:
+            return msg["content"]
+        if "text" in data["result"]:
+            return data["result"]["text"]
+        raise KeyError(f"Unexpected 'result' format: {data['result']}")
+
+    if "choices" in data and data["choices"]:
+        return data["choices"][0]["message"]["content"]
+
+    raise KeyError(f"No valid response field found: {data}")
+
+
+def send_email(body_text):
+    # 1) 타임스탬프 및 서명 생성
+    timestamp = str(int(time.time() * 1000))
+    message = f"POST {MAIL_URI}\n{timestamp}\n{ACCESS_KEY}"
+    signature = base64.b64encode(
+        hmac.new(
+            SECRET_KEY.encode("utf-8"),
+            message.encode("utf-8"),
+            digestmod=hashlib.sha256
+        ).digest()
+    ).decode("utf-8")
+
+    print("📰 요약 결과:\n", body_text)
+
+    # ❗ [수정 1] 본문의 줄바꿈(\n)을 HTML 태그(<br>)로 변경
+    html_body = body_text.replace('\n', '<br>')
+
+    # 2) 헤더 구성
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "x-ncp-apigw-timestamp": timestamp,
+        "x-ncp-iam-access-key": ACCESS_KEY,
+        "x-ncp-apigw-signature-v2": signature
+    }
+
+    payload = {
+        "senderAddress": SENDER_EMAIL,
+        "senderName": SENDER_NAME,
+        "title": "📰 오늘의 뉴스 클리핑",
+        "body": html_body,  # HTML로 변환된 본문 사용
+        # ❗ [수정 2] 본문이 HTML 형식임을 명시
+        "isHtmlContent": True,
+        "recipients": [
+            {
+                "address": RECIPIENT_EMAIL,
+                "name": RECIPIENT_NAME,
+                "type": "R"
+            }
+        ]
+    }
+
+    # 4) 요청 및 결과 반환
+    url = API_SERVER + MAIL_URI
+    resp = requests.post(url, headers=headers, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+
+if __name__ == "__main__":
+    # 1) 최신 뉴스 조회
+    articles = fetch_latest_news(query="인공지능", display=5)
+    summary_text = summarize_news(articles)
+
+    # 2) 메일 발송
+    result = send_email(summary_text)
+    print("메일 발송 결과:", result)
